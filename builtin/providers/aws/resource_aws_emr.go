@@ -6,11 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/emr"
+	"github.com/hashicorp/terraform/helper/resource"
 	"github.com/hashicorp/terraform/helper/schema"
 	"io/ioutil"
 	"net/http"
 	"strings"
+	"time"
 )
 
 func resourceAwsEMR() *schema.Resource {
@@ -115,6 +119,16 @@ func resourceAwsEMR() *schema.Resource {
 				Type:     schema.TypeString,
 				Optional: true,
 			},
+			"default_master_security_group": &schema.Schema{
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+			},
+			"default_slave_security_group": &schema.Schema{
+				Type:     schema.TypeString,
+				Optional: true,
+				Computed: true,
+			},
 		},
 	}
 }
@@ -186,8 +200,8 @@ func resourceAwsEMRCreate(d *schema.ResourceData, meta interface{}) error {
 		params.Tags = expandTags(tagsIn)
 	}
 	if v, ok := d.GetOk("configurations"); ok {
-		confUrl := v.(string)
-		params.Configurations = expandConfigures(confUrl)
+		confInput := v.(string)
+		params.Configurations = expandConfigures(confInput)
 	}
 
 	resp, err := conn.RunJobFlow(params)
@@ -201,10 +215,25 @@ func resourceAwsEMRCreate(d *schema.ResourceData, meta interface{}) error {
 	fmt.Println(resp)
 	d.SetId(*resp.JobFlowId)
 
-	return nil
+	return resourceAwsEMRRead(d, meta)
 }
 
 func resourceAwsEMRRead(d *schema.ResourceData, meta interface{}) error {
+	emrconn := meta.(*AWSClient).emrconn
+
+	req := &emr.DescribeClusterInput{
+		ClusterId: aws.String(d.Id()),
+	}
+
+	resp, err := emrconn.DescribeCluster(req)
+	if err != nil {
+		return fmt.Errorf("Error reading EMR cluster: %s", err)
+	}
+	fmt.Println(resp)
+
+	//Set the map computed value, not support yet, ref https://github.com/hashicorp/terraform/pull/7551
+	d.Set("default_master_security_group", resp.Cluster.Ec2InstanceAttributes.EmrManagedMasterSecurityGroup)
+	d.Set("default_slave_security_group", resp.Cluster.Ec2InstanceAttributes.EmrManagedSlaveSecurityGroup)
 
 	return nil
 }
@@ -262,7 +291,100 @@ func resourceAwsEMRDelete(d *schema.ResourceData, meta interface{}) error {
 		return err
 	}
 
+	log.Printf(
+		"[DEBUG] Waiting for EMR Cluster (%s) to become TERMINATED",
+		d.Id())
+
+	stateConf := &resource.StateChangeConf{
+		Pending:    []string{"STARTING", "BOOTSTRAPPING", "RUNNING", "WAITING", "TERMINATING"},
+		Target:     []string{"TERMINATED"},
+		Refresh:    resourceAwsEMRClusterStateRefreshFunc(d, meta),
+		Timeout:    40 * time.Minute,
+		MinTimeout: 10 * time.Second,
+	}
+
+	_, err = stateConf.WaitForState()
+	if err != nil {
+		return fmt.Errorf("[WARN] Error waiting for EMR Cluster state to be \"TERMINATED\": %s", err)
+	}
+
+	resourceAwsEmrSecurityGroupDelete(d, meta)
+
 	d.SetId("")
+
+	return nil
+}
+
+func resourceAwsEmrSecurityGroupDelete(d *schema.ResourceData, meta interface{}) error {
+	masterSG_id := d.Get("default_master_security_group").(string)
+	slaveSG_id := d.Get("default_slave_security_group").(string)
+
+	resourceAwsEmrSGRuleDel(masterSG_id, meta)
+	resourceAwsEmrSGRuleDel(slaveSG_id, meta)
+
+	resourceAwsEmrSGDel(masterSG_id, meta)
+	resourceAwsEmrSGDel(slaveSG_id, meta)
+
+	return nil
+}
+
+func resourceAwsEmrSGDel(sg_id string, meta interface{}) error {
+	log.Printf("[DEBUG] EMR Security Group destroy: %v", sg_id)
+
+	conn := meta.(*AWSClient).ec2conn
+
+	return resource.Retry(5*time.Minute, func() *resource.RetryError {
+		_, err := conn.DeleteSecurityGroup(&ec2.DeleteSecurityGroupInput{
+			GroupId: aws.String(sg_id),
+		})
+		if err != nil {
+			ec2err, ok := err.(awserr.Error)
+			if !ok {
+				return resource.RetryableError(err)
+			}
+
+			switch ec2err.Code() {
+			case "InvalidGroup.NotFound":
+				return nil
+			case "DependencyViolation":
+				// If it is a dependency violation, we want to retry
+				return resource.RetryableError(err)
+			default:
+				// Any other error, we want to quit the retry loop immediately
+				return resource.NonRetryableError(err)
+			}
+		}
+
+		return nil
+	})
+}
+
+func resourceAwsEmrSGRuleDel(sg_id string, meta interface{}) error {
+	conn := meta.(*AWSClient).ec2conn
+
+	awsMutexKV.Lock(sg_id)
+	defer awsMutexKV.Unlock(sg_id)
+
+	sg, err := findResourceSecurityGroup(conn, sg_id)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("[DEBUG] Revoking rule (%s) from security group %s:\n%v",
+		"ingress", sg_id, sg.IpPermissions)
+	req := &ec2.RevokeSecurityGroupIngressInput{
+		GroupId:       sg.GroupId,
+		IpPermissions: sg.IpPermissions,
+	}
+
+	_, err = conn.RevokeSecurityGroupIngress(req)
+
+	if err != nil {
+		return fmt.Errorf(
+			"Error revoking security group %s rules: %s",
+			sg_id, err)
+	}
+
 	return nil
 }
 
@@ -365,4 +487,39 @@ func readBodyJson(body string, target interface{}) error {
 		return err
 	}
 	return nil
+}
+
+func resourceAwsEMRClusterStateRefreshFunc(d *schema.ResourceData, meta interface{}) resource.StateRefreshFunc {
+	return func() (interface{}, string, error) {
+		conn := meta.(*AWSClient).emrconn
+
+		log.Printf("[INFO] Reading EMR Cluster Information: %s", d.Id())
+		params := &emr.DescribeClusterInput{
+			ClusterId: aws.String(d.Id()),
+		}
+
+		resp, err := conn.DescribeCluster(params)
+
+		if err != nil {
+			if awsErr, ok := err.(awserr.Error); ok {
+				if "ClusterNotFound" == awsErr.Code() {
+					return 42, "destroyed", nil
+				}
+			}
+			log.Printf("[WARN] Error on retrieving EMR Cluster (%s) when waiting: %s", d.Id(), err)
+			return nil, "", err
+		}
+
+		emrc := resp.Cluster
+
+		if emrc == nil {
+			return 42, "destroyed", nil
+		}
+
+		if resp.Cluster.Status != nil {
+			log.Printf("[DEBUG] EMR Cluster status (%s): %s", d.Id(), *resp.Cluster.Status)
+		}
+
+		return emrc, *emrc.Status.State, nil
+	}
 }
