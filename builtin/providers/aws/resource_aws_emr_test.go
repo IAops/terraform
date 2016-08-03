@@ -155,8 +155,6 @@ resource "aws_emr" "tf-test-cluster" {
   release_label = "emr-4.6.0"
   applications  = ["Spark"]
 
-  use_default_roles = true
-
   master_instance_type = "m3.xlarge"
   core_instance_type   = "m3.xlarge"
   core_instance_count  = 1
@@ -212,8 +210,6 @@ resource "aws_emr" "foo" {
   release_label = "emr-4.6.0"
   applications  = ["Spark"]
 
-  use_default_roles = true
-
   ec2_attributes {
     subnet_id      = "${aws_subnet.foo_VPC.id}"
   }
@@ -259,8 +255,6 @@ resource "aws_emr" "foo" {
   name          = "emr-core"
   release_label = "emr-4.6.0"
   applications  = ["Spark"]
-
-  use_default_roles = true
 
   ec2_attributes {
     subnet_id      = "${aws_subnet.foo_VPC.id}"
