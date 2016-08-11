@@ -398,6 +398,12 @@
 			"revision": "2cc71659118a868dc7544a7ef0808eb42d487011"
 		},
 		{
+			"checksumSHA1": "ItfiFqlpFPMY43TigxjpnY66KCI=",
+			"path": "github.com/aws/aws-sdk-go/service/configservice",
+			"revision": "b045cdd68772c8071562f745532fcc3efc9d56af",
+			"revisionTime": "2016-08-10T00:29:32Z"
+		},
+		{
 			"comment": "v1.1.23",
 			"path": "github.com/aws/aws-sdk-go/service/directoryservice",
 			"revision": "2cc71659118a868dc7544a7ef0808eb42d487011"
