@@ -27,6 +27,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go/service/codecommit"
 	"github.com/aws/aws-sdk-go/service/codedeploy"
+	"github.com/aws/aws-sdk-go/service/configservice"
 	"github.com/aws/aws-sdk-go/service/directoryservice"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/ec2"
@@ -114,6 +115,7 @@ type AWSClient struct {
 	glacierconn           *glacier.Glacier
 	codedeployconn        *codedeploy.CodeDeploy
 	codecommitconn        *codecommit.CodeCommit
+	configconn            *configservice.ConfigService
 }
 
 // Client configures and returns a fully initialized AWSClient
@@ -254,6 +256,9 @@ func (c *Config) Client() (interface{}, error) {
 
 		log.Println("[INFO] Initializing API Gateway")
 		client.apigateway = apigateway.New(sess)
+
+		log.Println("[INFO] Initializing Config Service Connection")
+		client.configconn = configservice.New(sess)
 
 		log.Println("[INFO] Initializing ECS Connection")
 		client.ecsconn = ecs.New(sess)
